@@ -1,0 +1,221 @@
+use crate::types::ast::*;
+
+grammar;
+
+// Ignore pattern. Code from lalrpop tutorial.
+match {
+    r"\s*" => {},                               // The default whitespace skipping is disabled if an `ignore pattern` is specified
+    r"//[^\n\r]*[\n\r]*" => {},                 // Skip `// comments`
+    r"/\*[^*]*\*+(?:[^/*][^*]*\*+)*/" => {},    // Skip `/* comments */`
+    _
+}
+
+pub CompUnit: CompUnit = <global_decls: GlobalDecl*> => CompUnit{ <> };
+
+FuncParam: FuncParam = <param_type: SysyType> <ident: Ident?> <indexes: ("[" <ConstExp?> "]")*> => FuncParam{ <> };
+
+GlobalDecl: GlobalDecl = {
+    <ret_type: SysyType> <ident: Ident> "(" ")" <block: Block> => GlobalDecl::FuncDecl{
+        ret_type,
+        ident,
+        func_params: vec![],
+        block: Some(block),
+    },
+    <ret_type: SysyType> <ident: Ident> "(" ")" ";" => GlobalDecl::FuncDecl{
+        ret_type,
+        ident,
+        func_params: vec![],
+        block: None,
+    },
+    <ret_type: SysyType> <ident: Ident> "(" <param1: FuncParam> <def_remain: ("," <FuncParam>)*> ")" <block: Block> => GlobalDecl::FuncDecl{
+        ret_type,
+        ident,
+        func_params: { let mut a = vec![param1]; a.extend(def_remain); a },
+        block: Some(block),
+    },
+    <ret_type: SysyType> <ident: Ident> "(" <param1: FuncParam> <def_remain: ("," <FuncParam>)*> ")" ";" => GlobalDecl::FuncDecl{
+        ret_type,
+        ident,
+        func_params: { let mut a = vec![param1]; a.extend(def_remain); a },
+        block: None,
+    },
+    <Decl> => GlobalDecl::OtherDecl( <> ),
+}
+
+SysyType: SysyType = {
+    "int" => SysyType::I32,
+    "int32_t" => SysyType::I32,
+    "void" => SysyType::VOID,
+    "unsigned" => SysyType::U32,
+    "short" => SysyType::I16,
+};
+
+Block: Block = "{" <items: BlockItem*> "}" => Block{ <> };
+
+BlockItem: BlockItem = {
+    <Decl> => BlockItem::D( <> ),
+    <Stmt> => BlockItem::S( <> ),
+};
+
+Decl: Decl = {
+    <ConstDecl> => Decl::C( <> ),
+    <VarDecl> => Decl::V( <> ),
+};
+
+ConstDecl: ConstDecl = "const" <decl_type: SysyType> <def1: ConstDef>
+        <def_remain: ("," <ConstDef>)*> ";" => ConstDecl{ <> };
+
+VarDecl: VarDecl = <decl_type: SysyType> <def1: VarDef>
+        <def_remain: ("," <VarDef>)*> ";" => VarDecl{ <> };
+
+ConstDef: ConstDef = <ident: Ident> <indexes: ("[" <ConstExp> "]")*> "=" <init_val: ConstInitVal> => ConstDef{ <> };
+
+VarDef: VarDef = <ident: Ident> <indexes: ("[" <ConstExp> "]")*> <init_val: ("=" <InitVal>)?> => VarDef{ <> };
+
+ConstExp: ConstExp = <expression: Expression> => ConstExp{ <> };
+
+ConstInitVal: ConstInitVal = {
+    <ConstExp> => ConstInitVal::Exp(<>),
+    "{" "}" => ConstInitVal::List(vec![]),
+    "{" <civ1: ConstInitVal> <civr: ("," <ConstInitVal>)*> "}" => ConstInitVal::List({
+        let mut a = vec![civ1];
+        a.extend(civr);
+        a
+    }),
+};
+
+InitVal: InitVal = {
+    <Expression> => InitVal::Exp(<>),
+    "{" "}" => InitVal::List(vec![]),
+    "{" <iv1: InitVal> <ivr: ("," <InitVal>)*>"}" => InitVal::List({
+        let mut a = vec![iv1];
+        a.extend(ivr);
+        a
+    }),
+}
+
+LVal: LVal = <ident: Ident> <indexes: ("[" <Expression> "]")*> => LVal{ <> };
+
+Stmt: Stmt = {
+    "return" <Expression?> ";" => Stmt::RET( <> ),
+    <lval: LVal> "=" <exp: Expression> ";" => Stmt::ASN{ <> },
+    <Expression?> ";" => Stmt::EXP( <> ),
+    "if" "(" <cond: Expression> ")" <stmt: Stmt> =>
+        Stmt::CND{ cond, stmt: Box::new(stmt), else_stmt: None },
+    "if" "(" <cond: Expression> ")" <stmt: WithElseStmt>
+        "else" <else_stmt: Stmt> =>
+        Stmt::CND{
+            cond,
+            stmt: Box::new(stmt),
+            else_stmt: Some(Box::new(else_stmt)),
+        },
+    "while" "(" <cond: Expression> ")" <stmt: Stmt> =>
+        Stmt::WHILE{ cond, stmt: Box::new(stmt) },
+    "break" ";" => Stmt::BREAK,
+    "continue" ";" => Stmt::CONT,
+    <Block> => Stmt::BLK(Box::new( <> )),
+};
+
+WithElseStmt: Stmt = {
+    "return" <Expression?> ";" => Stmt::RET( <> ),
+    <lval: LVal> "=" <exp: Expression> ";" => Stmt::ASN{ <> },
+    <Expression?> ";" => Stmt::EXP( <> ),
+    "if" "(" <cond: Expression> ")" <stmt: WithElseStmt>
+        "else" <else_stmt: WithElseStmt> =>
+        Stmt::CND{
+            cond,
+            stmt: Box::new(stmt),
+            else_stmt: Some(Box::new(else_stmt)),
+        },
+    "while" "(" <cond: Expression> ")" <stmt: WithElseStmt> =>
+        Stmt::WHILE{ cond, stmt: Box::new(stmt) },
+    "break" ";" => Stmt::BREAK,
+    "continue" ";" => Stmt::CONT,
+    <Block> => Stmt::BLK(Box::new( <> )),
+};
+
+Expression: Expression = <binary_exp: BinaryExp> => Expression{ <> };
+
+PrimaryExp: PrimaryExp = {
+    "(" <Expression> ")" => PrimaryExp::Exp(Box::new( <> )),
+    <Number> => PrimaryExp::Num( <> ),
+    <Ident> => PrimaryExp::Ident( <> ),
+}
+
+UnaryExp: UnaryExp = {
+    <PrimaryExp> => UnaryExp::U( <> ),
+    <unary_op: UnaryOp> <unary_exp: UnaryExp> => UnaryExp::B(unary_op, Box::new(unary_exp)),
+    <ident: Ident> <indexes: ("[" <Expression> "]")+> => UnaryExp::I(<>),
+    <ident: Ident> "(" ")" => UnaryExp::C(ident, vec![]),
+    <ident: Ident> "(" <param1: Expression> <param_remain: ("," <Expression>)*> ")" => UnaryExp::C(ident, {
+        let mut a = vec![param1];
+        a.extend(param_remain);
+        a
+    }),
+}
+
+BinaryExp: BinaryExp = {
+    #[precedence(level="0")]
+    <UnaryExp> => BinaryExp::U( <> ),
+    #[precedence(level="1")] #[assoc(side="left")]
+    <lhs: BinaryExp> <mul_op: MulOp> <rhs: BinaryExp> => 
+        BinaryExp::T(Box::new(lhs), mul_op, Box::new(rhs)),
+    #[precedence(level="2")] #[assoc(side="left")]
+    <lhs: BinaryExp> <op: AddOp> <rhs: BinaryExp> => 
+        BinaryExp::T(Box::new(lhs), op, Box::new(rhs)),
+    #[precedence(level="3")] #[assoc(side="left")]
+    <lhs: BinaryExp> <op: RelOp> <rhs: BinaryExp> => 
+        BinaryExp::T(Box::new(lhs), op, Box::new(rhs)),
+    #[precedence(level="4")] #[assoc(side="left")]
+    <lhs: BinaryExp> <op: EqOp> <rhs: BinaryExp> => 
+        BinaryExp::T(Box::new(lhs), op, Box::new(rhs)),
+    #[precedence(level="5")] #[assoc(side="left")]
+    <lhs: BinaryExp> <op: LAndOp> <rhs: BinaryExp> => 
+        BinaryExp::T(Box::new(lhs), op, Box::new(rhs)),
+    #[precedence(level="6")] #[assoc(side="left")]
+    <lhs: BinaryExp> <op: LOrOp> <rhs: BinaryExp> => 
+        BinaryExp::T(Box::new(lhs), op, Box::new(rhs)),
+}
+
+UnaryOp: Op = {
+    "+" => Op::Add,
+    "-" => Op::Sub,
+    "!" => Op::Not,
+}
+
+MulOp: Op = {
+    "*" => Op::Mul,
+    "/" => Op::Div,
+    "%" => Op::Mod,
+}
+
+AddOp: Op = {
+    "+" => Op::Add,
+    "-" => Op::Sub,
+}
+
+RelOp: Op = {
+    ">" => Op::Gt,
+    "<" => Op::Lt,
+    ">=" => Op::Ge,
+    "<=" => Op::Le,
+}
+
+EqOp: Op = {
+    "==" => Op::Eq,
+    "!=" => Op::Ne,
+}
+
+LAndOp: Op = "&&" => Op::And;
+
+LOrOp: Op = "||" => Op::Or;
+
+Number: i32 = <num: IntConst> => <>;
+
+Ident: String = r"[_a-zA-Z][_a-zA-Z0-9]*" => <>.to_string();
+
+IntConst: i32 = {
+    r"[1-9][0-9]*" => i32::from_str_radix(<>, 10).unwrap(),
+    r"0[0-7]*" => i32::from_str_radix(<>, 8).unwrap(),
+    r"0[xX][0-9a-fA-F]+" => i32::from_str_radix(&<>[2..], 16).unwrap(),
+}
