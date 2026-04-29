@@ -9,6 +9,9 @@ pub mod types;
 pub mod parser;
 pub mod irgen;
 pub mod rvgen;
+pub mod x86gen;
+pub mod lagen;
+pub mod y86gen;
 
 struct FileOrStdout (Box<dyn Write>);
 
@@ -33,13 +36,44 @@ impl Write for FileOrStdout {
 fn main() -> Result<()> {
     Type::set_ptr_size(4);
     let mut output_ir = false;
+    let mut output_x64 = false;
+    let mut output_la64 = false;
     let mut input = String::new();
     let mut output = String::new();
     {
         let args: Vec<String> = args().collect();
-        output_ir = args[1] == "-koopa";
-        input = args[2].clone();
-        output = args[4].clone();
+        if args.len() < 2 {
+            eprintln!("Usage: {} [-koopa] [-x64] <input> [-o <output>]", args[0]);
+            std::process::exit(1);
+        }
+        let mut i = 1;
+        while i < args.len() {
+            match args[i].as_str() {
+                "-koopa" => {
+                    output_ir = true;
+                    i += 1;
+                }
+                "-x64" => {
+                    output_x64 = true;
+                    i += 1;
+                }
+                "-la64" => {
+                    output_la64 = true;
+                    i += 1;
+                }
+                "-o" => {
+                    i += 1;
+                    if i < args.len() {
+                        output = args[i].clone();
+                    }
+                    i += 1;
+                }
+                _ => {
+                    input = args[i].clone();
+                    i += 1;
+                }
+            }
+        }
     }
 
     let input = read_to_string(input)?;
@@ -54,6 +88,10 @@ fn main() -> Result<()> {
     if output_ir {
         let mut generator = KoopaGenerator::new(&mut output);
         generator.generate_on(&irgen::ast_to_koopa(ast))?;
+    } else if output_x64 {
+        x86gen::generator_x64(&irgen::ast_to_koopa(ast), &mut output)?;
+    } else if output_la64 {
+        lagen::generator_la(&irgen::ast_to_koopa(ast), &mut output)?;
     } else {
         rvgen::generator_rv(&irgen::ast_to_koopa(ast), &mut output)?;
     }

@@ -430,7 +430,7 @@ impl InitVal {
     }
 }
 
-fn optimize_block(input: &mut Block, outer_info: Option<* mut AstGlobalInfo>) {
+fn optimize_block(input: &mut Block, outer_info: Option<&AstGlobalInfo<'_>>) {
     let mut info = AstGlobalInfo::new();
     info.set_outer(outer_info);
     for item in &mut input.items {
@@ -497,7 +497,7 @@ fn optimize_block(input: &mut Block, outer_info: Option<* mut AstGlobalInfo>) {
                     },
                     Stmt::EXP(None) => (),
                     Stmt::BLK(blk) => {
-                        optimize_block(blk, Some(&mut info));
+                        optimize_block(blk, Some(&info));
                     },
                     Stmt::CND { cond, stmt, else_stmt } => {
                         // cond opt
@@ -507,7 +507,7 @@ fn optimize_block(input: &mut Block, outer_info: Option<* mut AstGlobalInfo>) {
                             Stmt::BLK(blk) => (**blk).clone(),
                             other => Block::new_single_stmt(other.clone()),
                         };
-                        optimize_block(&mut blk, Some(&mut info));
+                        optimize_block(&mut blk, Some(&info));
                         **stmt = Stmt::BLK(Box::new(blk));
                         // else opt
                         if let Some(stmt) = else_stmt {
@@ -515,7 +515,7 @@ fn optimize_block(input: &mut Block, outer_info: Option<* mut AstGlobalInfo>) {
                                 Stmt::BLK(blk) => (**blk).clone(),
                                 other => Block::new_single_stmt(other.clone()),
                             };
-                            optimize_block(&mut blk, Some(&mut info));
+                            optimize_block(&mut blk, Some(&info));
                             **stmt = Stmt::BLK(Box::new(blk));
                         }
                     },
@@ -527,7 +527,7 @@ fn optimize_block(input: &mut Block, outer_info: Option<* mut AstGlobalInfo>) {
                             Stmt::BLK(blk) => (**blk).clone(),
                             other => Block::new_single_stmt(other.clone()),
                         };
-                        optimize_block(&mut blk, Some(&mut info));
+                        optimize_block(&mut blk, Some(&info));
                         **stmt = Stmt::BLK(Box::new(blk));
                     },
                     Stmt::BREAK => (),
@@ -538,13 +538,13 @@ fn optimize_block(input: &mut Block, outer_info: Option<* mut AstGlobalInfo>) {
     }
 }
 
-fn process_block(func_data: &mut FunctionData, block: &Block, bb: &BasicBlock, outer_info: Option<* mut AstGlobalInfo>) {
+fn process_block(func_data: &mut FunctionData, block: &Block, bb: &BasicBlock, outer_info: Option<&AstGlobalInfo<'_>>) {
     let mut info = AstGlobalInfo::new();
     info.set_outer(outer_info);
     let mut bb = *bb;
 
     for item in &block.items {
-        if info.returned {
+        if info.returned.get() {
             break;
         }
         match item {
@@ -563,7 +563,7 @@ fn process_block(func_data: &mut FunctionData, block: &Block, bb: &BasicBlock, o
                             func_data.layout_mut().bb_mut(bb).insts_mut().extend([allocvar]);
                             if let Some(init_val) = &x.init_val {
                                 let old_bb = bb;
-                                let result = init_val.generate(&mut info, func_data, &mut bb, ty.clone());
+                                let result = init_val.generate(&info, func_data, &mut bb, ty.clone());
                                 if bb != old_bb {
                                     info.set_outer_should_update_bb(bb);
                                 }
@@ -588,7 +588,7 @@ fn process_block(func_data: &mut FunctionData, block: &Block, bb: &BasicBlock, o
                             info.add_symbol(x.ident.clone(), (VarType::Var(ty.clone()), 0));
                             func_data.dfg_mut().set_value_name(allocvar, format!("@{}", x.ident).into());
                             func_data.layout_mut().bb_mut(bb).insts_mut().extend([allocvar]);
-                            let result = x.init_val.generate(&mut info, func_data, ty.clone());
+                            let result = x.init_val.generate(&info, func_data, ty.clone());
                             let inst = func_data.dfg_mut().new_value().store(result, allocvar);
                             func_data.layout_mut().bb_mut(bb).insts_mut().extend([inst]);
                         };
@@ -602,7 +602,7 @@ fn process_block(func_data: &mut FunctionData, block: &Block, bb: &BasicBlock, o
                     Stmt::RET(exp) => {
                         let result = if let Some(exp) = exp {
                             let old_bb = bb;
-                            let result = Some(exp.generate(&mut info, func_data, &mut bb));
+                            let result = Some(exp.generate(&info, func_data, &mut bb));
                             if old_bb != bb {
                                 info.set_outer_should_update_bb(bb);
                             }
@@ -641,7 +641,7 @@ fn process_block(func_data: &mut FunctionData, block: &Block, bb: &BasicBlock, o
                             dest = inst;
                             first_iter = false;
                         }
-                        let result = exp.generate(&mut info, func_data, &mut bb);
+                        let result = exp.generate(&info, func_data, &mut bb);
                         if old_bb != bb {
                             info.set_outer_should_update_bb(bb);
                         }
@@ -650,17 +650,17 @@ fn process_block(func_data: &mut FunctionData, block: &Block, bb: &BasicBlock, o
                     },
                     Stmt::EXP(Some(exp)) => {
                         let old_bb = bb;
-                        exp.generate(&mut info, func_data, &mut bb);
+                        exp.generate(&info, func_data, &mut bb);
                         if old_bb != bb {
                             info.set_outer_should_update_bb(bb);
                         }
                     },
                     Stmt::EXP(None) => (),
                     Stmt::BLK(blk) => {
-                        process_block(func_data, blk, &bb, Some(&mut info));
+                        process_block(func_data, blk, &bb, Some(&info));
                         // if inner block updates bb, we should update and propagate
-                        if let Some(new_bb) = info.should_update_bb {
-                            info.should_update_bb = None;
+                        if let Some(new_bb) = info.should_update_bb.get() {
+                            info.should_update_bb.set(None);
                             info.set_outer_should_update_bb(new_bb);
                             bb = new_bb;
                         }
@@ -675,13 +675,13 @@ fn process_block(func_data: &mut FunctionData, block: &Block, bb: &BasicBlock, o
                             false_bb
                         };
                         func_data.layout_mut().bbs_mut().extend([true_bb, false_bb, next_bb]);
-                        let cond = cond.generate(&mut info, func_data, &mut bb);
+                        let cond = cond.generate(&info, func_data, &mut bb);
                         let inst = func_data.dfg_mut().new_value().branch(cond, true_bb, false_bb);
                         func_data.layout_mut().bb_mut(bb).insts_mut().extend([inst]);
-                        info.ret_target_bb = Some(next_bb);
+                        info.ret_target_bb.set(Some(next_bb));
                         match &**stmt {
                             Stmt::BLK(blk) => {
-                                process_block(func_data, &blk, &true_bb, Some(&mut info));
+                                process_block(func_data, &blk, &true_bb, Some(&info));
                             },
                             _ => {
                                 panic!("Not optimized?");
@@ -690,18 +690,18 @@ fn process_block(func_data: &mut FunctionData, block: &Block, bb: &BasicBlock, o
                         if let Some(else_stmt) = else_stmt {
                             match &**else_stmt {
                                 Stmt::BLK(blk) => {
-                                    process_block(func_data, &blk, &false_bb, Some(&mut info));
+                                    process_block(func_data, &blk, &false_bb, Some(&info));
                                 },
                                 _ => {
                                     panic!("Not optimized?");
                                 }
                             }
                         }
-                        info.ret_target_bb = None;
+                        info.ret_target_bb.set(None);
                         bb = next_bb;
                         info.set_outer_should_update_bb(next_bb);
                         // We should update bb, but not related to inner block
-                        info.should_update_bb = None;
+                        info.should_update_bb.set(None);
                     },
                     Stmt::WHILE { cond, stmt } => {
                         let mut cond_bb = func_data.dfg_mut().new_bb().basic_block(None);
@@ -713,26 +713,26 @@ fn process_block(func_data: &mut FunctionData, block: &Block, bb: &BasicBlock, o
                         func_data.layout_mut().bb_mut(bb).insts_mut().extend([inst]);
                         // generate condition
                         let old_cond_bb = cond_bb;
-                        let cond = cond.generate(&mut info, func_data, &mut cond_bb);
+                        let cond = cond.generate(&info, func_data, &mut cond_bb);
                         let inst = func_data.dfg_mut().new_value().branch(cond, body_bb, next_bb);
                         func_data.layout_mut().bb_mut(cond_bb).insts_mut().extend([inst]);
                         let cond_bb = old_cond_bb;
                         // generate body
-                        info.ret_target_bb = Some(cond_bb);
-                        info.loop_break_target = Some(next_bb);
-                        info.loop_cont_target = Some(cond_bb);
+                        info.ret_target_bb.set(Some(cond_bb));
+                        info.loop_break_target.set(Some(next_bb));
+                        info.loop_cont_target.set(Some(cond_bb));
                         match &**stmt {
                             Stmt::BLK(blk) => {
-                                process_block(func_data, &blk, &body_bb, Some(&mut info));
+                                process_block(func_data, &blk, &body_bb, Some(&info));
                             },
                             _ => panic!("Not optimized?"),
                         }
-                        info.ret_target_bb = None;
-                        info.loop_break_target = None;
-                        info.loop_cont_target = None;
+                        info.ret_target_bb.set(None);
+                        info.loop_break_target.set(None);
+                        info.loop_cont_target.set(None);
                         bb = next_bb;
                         info.set_outer_should_update_bb(next_bb);
-                        info.should_update_bb = None;
+                        info.should_update_bb.set(None);
                         
                     },
                     Stmt::BREAK => {
@@ -753,7 +753,7 @@ fn process_block(func_data: &mut FunctionData, block: &Block, bb: &BasicBlock, o
             }
         }
     }
-    if !info.returned {
+    if !info.returned.get() {
         if let Some(target_bb) = info.get_ret_target_bb() {
             let branch = func_data.dfg_mut().new_value().jump(target_bb);
             func_data.layout_mut().bb_mut(bb).insts_mut().extend([branch]);
@@ -775,20 +775,18 @@ fn process_block(func_data: &mut FunctionData, block: &Block, bb: &BasicBlock, o
     }
 }
 
-fn process_func(prog: &mut Program, ret_type: &SysyType, func_params: &Vec<FuncParam>, ident: &String, block: &mut Block, global_info: Option<* mut AstGlobalInfo>) -> Function {
+fn process_func(prog: &mut Program, ret_type: &SysyType, func_params: &Vec<FuncParam>, ident: &String, block: &mut Block, root_info: &mut AstGlobalInfo<'_>) -> Function {
     let mut info = AstGlobalInfo::new();
-    info.set_outer(global_info);
 
-    let func_data = FunctionData::new(format!("@{}", ident), func_params.iter().map(|param| param.ty(&info).get_koopa_type()).collect(), ret_type.get_koopa_type());
+    let func_data = FunctionData::new(format!("@{}", ident), func_params.iter().map(|param| param.ty(root_info).get_koopa_type()).collect(), ret_type.get_koopa_type());
     let func = prog.new_func(func_data);
+    root_info.add_func_symbol(ident.clone(), func);
+
+    info.set_outer(Some(&*root_info));
+
     let func_data = prog.func_mut(func);
     let entry = func_data.dfg_mut().new_bb().basic_block(Some("%entry".into()));
     func_data.layout_mut().bbs_mut().extend([entry]);
-    if let Some(ptr) = global_info {
-        unsafe {
-            (*ptr).add_func_symbol(ident.clone(), func);
-        }
-    }
 
     // Process params to local variables
     let mut local_params = Vec::new();
@@ -810,9 +808,9 @@ fn process_func(prog: &mut Program, ret_type: &SysyType, func_params: &Vec<FuncP
         }
     }
 
-    optimize_block(block, Some(&mut info)); // Symbol check and const propagation
+    optimize_block(block, Some(&info)); // Symbol check and const propagation
     let block = &*block;
-    process_block(func_data, &block, &entry, Some(&mut info));
+    process_block(func_data, &block, &entry, Some(&info));
 
     func
 }
@@ -858,7 +856,7 @@ pub fn ast_to_koopa(mut input: CompUnit) -> Program {
                 }
                 match block.as_mut() {
                     Some(blk) => {
-                        process_func(&mut prog, &ret_type, &func_params, &ident, blk, Some(&mut global_info));
+                        process_func(&mut prog, &ret_type, &func_params, &ident, blk, &mut global_info);
                     },
                     None => {
                         let func_data = FunctionData::new_decl(format!("@{}", ident).into(), func_params.iter().map(|x| x.ty(&global_info).get_koopa_type()).collect(), ret_type.get_koopa_type());

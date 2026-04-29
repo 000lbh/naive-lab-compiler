@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::collections::HashMap;
 
 use koopa::ir::types::Type;
@@ -26,169 +27,113 @@ pub enum VarType {
 }
 
 #[derive(Debug)]
-pub struct AstGlobalInfo {
+pub struct AstGlobalInfo<'a> {
     symbol_table: HashMap<String, (VarType, i32)>,
     var_symbol_table: HashMap<String, Value>,
     func_symbol_table: HashMap<String, Function>,
-    pub ret_target_bb: Option<BasicBlock>,
-    pub should_update_bb: Option<BasicBlock>,
-    pub loop_break_target: Option<BasicBlock>,
-    pub loop_cont_target: Option<BasicBlock>,
-    pub returned: bool,
-    pub counter: i32,
-    pub outer: Option<* mut AstGlobalInfo>,
+    pub ret_target_bb: Cell<Option<BasicBlock>>,
+    pub should_update_bb: Cell<Option<BasicBlock>>,
+    pub loop_break_target: Cell<Option<BasicBlock>>,
+    pub loop_cont_target: Cell<Option<BasicBlock>>,
+    pub returned: Cell<bool>,
+    pub counter: Cell<i32>,
+    pub outer: Option<&'a AstGlobalInfo<'a>>,
 }
 
-impl AstGlobalInfo {
+impl<'a> AstGlobalInfo<'a> {
     pub fn new() -> Self {
         AstGlobalInfo {
             symbol_table: HashMap::new(),
             var_symbol_table: HashMap::new(),
             func_symbol_table: HashMap::new(),
-            ret_target_bb: None,
-            should_update_bb: None,
-            loop_break_target: None,
-            loop_cont_target: None,
-            counter: 0,
-            returned: false,
+            ret_target_bb: Cell::new(None),
+            should_update_bb: Cell::new(None),
+            loop_break_target: Cell::new(None),
+            loop_cont_target: Cell::new(None),
+            counter: Cell::new(0),
+            returned: Cell::new(false),
             outer: None,
         }
     }
-    pub fn set_outer(&mut self, outer: Option<* mut AstGlobalInfo>) {
+    pub fn set_outer(&mut self, outer: Option<&'a AstGlobalInfo<'a>>) {
         self.outer = outer;
     }
     pub fn find_symbol(&self, key: &String) -> Option<&(VarType, i32)> {
-        let mut result = self.symbol_table.get(key);
-        if result.is_none() {
-            if let Some(ptr) = self.outer {
-                unsafe {
-                    result = (*ptr).find_symbol(key);
-                }
-            }
-        }
-        result
+        self.symbol_table.get(key).or_else(|| {
+            self.outer.and_then(|outer| outer.find_symbol(key))
+        })
     }
     pub fn add_symbol(&mut self, key: String, value: (VarType, i32)) -> Option<(VarType, i32)> {
         self.symbol_table.insert(key, value)
     }
     pub fn find_var_symbol(&self, key: &String) -> Option<&Value> {
-        let mut result = self.var_symbol_table.get(key);
-        if result.is_none() {
-            if let Some(ptr) = self.outer {
-                unsafe {
-                    result = (*ptr).find_var_symbol(key);
-                }
-            }
-        }
-        result
+        self.var_symbol_table.get(key).or_else(|| {
+            self.outer.and_then(|outer| outer.find_var_symbol(key))
+        })
     }
     pub fn add_var_symbol(&mut self, key: String, value: Value) -> Option<Value> {
         self.var_symbol_table.insert(key, value)
     }
     pub fn find_func_symbol(&self, key: &String) -> Option<&Function> {
-        let mut result = self.func_symbol_table.get(key);
-        if result.is_none() {
-            if let Some(ptr) = self.outer {
-                unsafe {
-                    result = (*ptr).find_func_symbol(key);
-                }
-            }
-        }
-        result
+        self.func_symbol_table.get(key).or_else(|| {
+            self.outer.and_then(|outer| outer.find_func_symbol(key))
+        })
     }
-    // Always add to the top.
     pub fn add_func_symbol(&mut self, key: String, value: Function) -> Option<Function> {
-        if let Some(ptr) = self.outer {
-            unsafe {
-                (*ptr).add_func_symbol(key, value)
-            }
-        } else {
-            self.func_symbol_table.insert(key, value)
-        }
+        self.func_symbol_table.insert(key, value)
     }
     pub fn has_symbol_conflict(&self, key: String) -> bool {
-        self.symbol_table.contains_key(&key) || 
+        self.symbol_table.contains_key(&key) ||
         self.var_symbol_table.contains_key(&key) ||
         self.func_symbol_table.contains_key(&key)
     }
     pub fn get_ret_target_bb(&self) -> Option<BasicBlock> {
-        if let Some(ptr) = self.outer {
-            unsafe {
-                (*ptr).ret_target_bb
-            }
-        }
-        else {
-            None
-        }
+        self.outer.map_or(None, |outer| outer.ret_target_bb.get())
     }
     pub fn get_loop_break_target(&self) -> Option<BasicBlock> {
-        if let Some(ptr) = self.outer {
-            unsafe {
-                if (*ptr).loop_break_target.is_some() {
-                    (*ptr).loop_break_target
-                }
-                else {
-                    (*ptr).get_loop_break_target()
-                }
+        if let Some(outer) = self.outer {
+            if outer.loop_break_target.get().is_some() {
+                outer.loop_break_target.get()
+            } else {
+                outer.get_loop_break_target()
             }
-        }
-        else {
+        } else {
             None
         }
     }
     pub fn get_loop_cont_target(&self) -> Option<BasicBlock> {
-        if let Some(ptr) = self.outer {
-            unsafe {
-                if (*ptr).loop_cont_target.is_some() {
-                    (*ptr).loop_cont_target
-                }
-                else {
-                    (*ptr).get_loop_cont_target()
-                }
+        if let Some(outer) = self.outer {
+            if outer.loop_cont_target.get().is_some() {
+                outer.loop_cont_target.get()
+            } else {
+                outer.get_loop_cont_target()
             }
-        }
-        else {
+        } else {
             None
         }
     }
-    pub fn set_outer_should_update_bb(&mut self, bb: BasicBlock) {
+    pub fn set_outer_should_update_bb(&self, bb: BasicBlock) {
         if self.is_func_info() || self.is_global_info() {
             return;
         }
-        if let Some(ptr) = self.outer {
-            unsafe {
-                (*ptr).should_update_bb = Some(bb);
-            }
+        if let Some(outer) = self.outer {
+            outer.should_update_bb.set(Some(bb));
         }
     }
-    pub fn set_returned(&mut self) {
-        if self.ret_target_bb.is_some() {
+    pub fn set_returned(&self) {
+        if self.ret_target_bb.get().is_some() {
             return;
         }
-        self.returned = true;
-        if let Some(ptr) = self.outer {
-            unsafe {
-                (*ptr).set_returned();
-            }
+        self.returned.set(true);
+        if let Some(outer) = self.outer {
+            outer.set_returned();
         }
     }
     pub fn is_global_info(&self) -> bool {
         self.outer.is_none()
     }
     pub fn is_func_info(&self) -> bool {
-        if let Some(ptr) = self.outer {
-            unsafe {
-                if let Some(ptr) = (*ptr).outer {
-                    (*ptr).is_global_info()
-                }
-                else {
-                    false
-                }
-            }
-        }
-        else {
-            false
-        }
+        self.outer.map_or(false, |outer| outer.is_global_info())
     }
 }
 
