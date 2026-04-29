@@ -7,6 +7,7 @@ use koopa::back::KoopaGenerator;
 
 pub mod types;
 pub mod parser;
+pub mod asm;
 pub mod irgen;
 pub mod rvgen;
 pub mod x86gen;

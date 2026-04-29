@@ -4,147 +4,222 @@ use std::collections::{HashMap, HashSet};
 use koopa::ir::*;
 use koopa::back::NameManager;
 
-/// LoongArch64 caller-saved registers (allocated first, flushed before calls)
-/// t0-t7 = $r12-$r19  (8 regs)
+use super::asm::{AsmEmit, peephole2, peephole3};
+
+// ─── LoongArch Structured Instruction ────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub enum LAInst {
+    // Arithmetic (word = 32-bit)
+    AddW  { rd: String, rj: String, rk: String },
+    SubW  { rd: String, rj: String, rk: String },
+    MulW  { rd: String, rj: String, rk: String },
+    DivW  { rd: String, rj: String, rk: String },
+    ModW  { rd: String, rj: String, rk: String },
+    And   { rd: String, rj: String, rk: String },
+    Or    { rd: String, rj: String, rk: String },
+    Xor   { rd: String, rj: String, rk: String },
+    Slt   { rd: String, rj: String, rk: String },
+    Sltu  { rd: String, rj: String, rk: String },
+    Sltui { rd: String, rj: String, imm: u16 },
+    Xori  { rd: String, rj: String, imm: u16 },
+    // Immediate
+    Ori    { rd: String, rj: String, imm: u16 },
+    Lu12iW { rd: String, imm: i32 },
+    AddiW  { rd: String, rj: String, imm: i32 },
+    AddiD  { rd: String, rj: String, imm: i32 },
+    // Memory
+    LdW { rd: String, rj: String, offset: i32 },
+    StW { rd: String, rj: String, offset: i32 },
+    LdD { rd: String, rj: String, offset: i32 },
+    StD { rd: String, rj: String, offset: i32 },
+    // PC-relative
+    Pcalau12i { rd: String, symbol: String },
+    // Branch
+    Beq  { rj: String, rk: String, label: String },
+    Bne  { rj: String, rk: String, label: String },
+    Beqz { rj: String, label: String },
+    Bnez { rj: String, label: String },
+    Blt  { rj: String, rk: String, label: String },
+    Bge  { rj: String, rk: String, label: String },
+    B    { label: String },
+    Bl   { symbol: String },
+    Jirl { rd: String, rj: String, offset: i32 },
+    // Labels / directives
+    Label(String),
+    Directive(String),
+}
+
+impl AsmEmit for LAInst {
+    fn emit(&self, writer: &mut dyn Write) -> Result<()> {
+        match self {
+            LAInst::AddW  { rd, rj, rk } => writeln!(writer, "\tadd.w {}, {}, {}", rd, rj, rk),
+            LAInst::SubW  { rd, rj, rk } => writeln!(writer, "\tsub.w {}, {}, {}", rd, rj, rk),
+            LAInst::MulW  { rd, rj, rk } => writeln!(writer, "\tmul.w {}, {}, {}", rd, rj, rk),
+            LAInst::DivW  { rd, rj, rk } => writeln!(writer, "\tdiv.w {}, {}, {}", rd, rj, rk),
+            LAInst::ModW  { rd, rj, rk } => writeln!(writer, "\tmod.w {}, {}, {}", rd, rj, rk),
+            LAInst::And   { rd, rj, rk } => writeln!(writer, "\tand {}, {}, {}", rd, rj, rk),
+            LAInst::Or    { rd, rj, rk } => writeln!(writer, "\tor {}, {}, {}", rd, rj, rk),
+            LAInst::Xor   { rd, rj, rk } => writeln!(writer, "\txor {}, {}, {}", rd, rj, rk),
+            LAInst::Slt   { rd, rj, rk } => writeln!(writer, "\tslt {}, {}, {}", rd, rj, rk),
+            LAInst::Sltu  { rd, rj, rk } => writeln!(writer, "\tsltu {}, {}, {}", rd, rj, rk),
+            LAInst::Sltui { rd, rj, imm } => writeln!(writer, "\tsltui {}, {}, {}", rd, rj, imm),
+            LAInst::Xori  { rd, rj, imm } => writeln!(writer, "\txori {}, {}, {}", rd, rj, imm),
+            LAInst::Ori    { rd, rj, imm } => writeln!(writer, "\tori {}, {}, {}", rd, rj, imm),
+            LAInst::Lu12iW { rd, imm } => writeln!(writer, "\tlu12i.w {}, {}", rd, imm),
+            LAInst::AddiW  { rd, rj, imm } => writeln!(writer, "\taddi.w {}, {}, {}", rd, rj, imm),
+            LAInst::AddiD  { rd, rj, imm } => writeln!(writer, "\taddi.d {}, {}, {}", rd, rj, imm),
+            LAInst::LdW { rd, rj, offset } => writeln!(writer, "\tld.w {}, {}, {}", rd, rj, offset),
+            LAInst::StW { rd, rj, offset } => writeln!(writer, "\tst.w {}, {}, {}", rd, rj, offset),
+            LAInst::LdD { rd, rj, offset } => writeln!(writer, "\tld.d {}, {}, {}", rd, rj, offset),
+            LAInst::StD { rd, rj, offset } => writeln!(writer, "\tst.d {}, {}, {}", rd, rj, offset),
+            LAInst::Pcalau12i { rd, symbol } => writeln!(writer, "\tpcalau12i {}, %pc_hi20({})", rd, symbol),
+            LAInst::Beq  { rj, rk, label } => writeln!(writer, "\tbeq {}, {}, {}", rj, rk, label),
+            LAInst::Bne  { rj, rk, label } => writeln!(writer, "\tbne {}, {}, {}", rj, rk, label),
+            LAInst::Beqz { rj, label } => writeln!(writer, "\tbeqz {}, {}", rj, label),
+            LAInst::Bnez { rj, label } => writeln!(writer, "\tbnez {}, {}", rj, label),
+            LAInst::Blt  { rj, rk, label } => writeln!(writer, "\tblt {}, {}, {}", rj, rk, label),
+            LAInst::Bge  { rj, rk, label } => writeln!(writer, "\tbge {}, {}, {}", rj, rk, label),
+            LAInst::B    { label } => writeln!(writer, "\tb {}", label),
+            LAInst::Bl   { symbol } => writeln!(writer, "\tbl {}", symbol),
+            LAInst::Jirl { rd, rj, offset } => writeln!(writer, "\tjirl {}, {}, {}", rd, rj, offset),
+            LAInst::Label(s) => writeln!(writer, "{}:", s),
+            LAInst::Directive(s) => writeln!(writer, "{}", s),
+        }
+    }
+}
+
+// ─── Peephole Optimizations ──────────────────────────────────────────────────
+
+fn optimize_la(insts: &mut Vec<LAInst>) {
+    // Rule 1: Dead store elimination — consecutive st.w to same sp offset
+    peephole2(insts, |a, b| {
+        if let (LAInst::StW { rj: b1, offset: o1, .. }, LAInst::StW { rj: b2, offset: o2, .. }) = (a, b) {
+            if b1 == "$sp" && b2 == "$sp" && o1 == o2 { return Some(vec![b.clone()]); }
+        }
+        None
+    });
+    // Rule 2: Redundant load after store: st.w $a0, $sp, N; ld.w $a0, $sp, N → st.w
+    peephole2(insts, |a, b| {
+        if let (LAInst::StW { rd, rj: b1, offset: o1 }, LAInst::LdW { rd: lrd, rj: b2, offset: o2 }) = (a, b) {
+            if b1 == b2 && o1 == o2 && b1 == "$sp" && rd == lrd { return Some(vec![a.clone()]); }
+        }
+        None
+    });
+    // Rule 3: Constant folding — ori rd, zero, 0; add.w rd, rs, rd → or rd, rs, zero
+    peephole2(insts, |a, b| {
+        if let (LAInst::Ori { rd: d1, rj, imm: 0 }, LAInst::AddW { rd: d2, rj: rj2, rk }) = (a, b) {
+            if rj == "$zero" && d1 == d2 && d2 == rk { return Some(vec![LAInst::Or { rd: d1.clone(), rj: rj2.clone(), rk: "$zero".into() }]); }
+        }
+        None
+    });
+    // Rule 4: Remove mov-to-self
+    peephole2(insts, |a, _b| {
+        if let LAInst::Or { rd, rj, rk } = a {
+            if (rj == rd && rk == "$zero") || (rk == rd && rj == "$zero") {
+                return Some(vec![]);
+            }
+        }
+        None
+    });
+    // Rule 5: ld.w after st.w with intermediate mov → can be optimized
+    peephole3(insts, |a, b, c| {
+        if let (LAInst::StW { rd: srd, rj: b1, offset: o1 }, LAInst::Or { rd: mrd, rj: mj, rk: mk }, LAInst::LdW { rd: lrd, rj: b2, offset: o2 }) = (a, b, c) {
+            if b1 == b2 && o1 == o2 && b1 == "$sp" && srd == lrd && mrd == srd {
+                if (mj == srd && mk == "$zero") || (mk == srd && mj == "$zero") {
+                    return Some(vec![a.clone(), b.clone()]);
+                }
+            }
+        }
+        None
+    });
+}
+
+// ─── Register allocation state ───────────────────────────────────────────────
+
 const CALLER_SAVED_REGS: &[&str] = &["t0", "t1", "t2", "t3", "t4", "t5", "t6", "t7"];
-/// LoongArch64 callee-saved registers (allocated when caller-saved exhausted)
-/// s0-s8 = $r23-$r31  (9 regs), $fp = $r22 is reserved as frame pointer
 const CALLEE_SAVED_REGS: &[&str] = &["s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8"];
-/// LoongArch argument registers (System V ABI: a0-a7 = $r4-$r11)
 const ARG_REGS: &[&str] = &["a0", "a1", "a2", "a3", "a4", "a5", "a6", "a7"];
 
 #[derive(Debug, Clone)]
-struct LiveInterval {
-    value: Value,
-    start: usize,
-    end: usize,
-    reg: Option<String>,
-    spilled: bool,
-}
+struct LiveInterval { value: Value, start: usize, end: usize, reg: Option<String>, spilled: bool }
 
 struct GenLAInfo {
-    stackmem: usize,
-    stackmap: HashMap<Value, usize>,
-    allocmap: HashMap<Value, usize>,
-    globalmap: HashMap<Value, usize>,
-    namemgr: NameManager,
-    reg_map: HashMap<Value, String>,
-    spill_map: HashMap<Value, usize>,
-    used_callee_regs: Vec<String>,
-    used_caller_regs: Vec<String>,
-    caller_saved_set: HashSet<String>,
-    next_spill_offset: usize,
+    stackmem: usize, stackmap: HashMap<Value, usize>, allocmap: HashMap<Value, usize>,
+    globalmap: HashMap<Value, usize>, namemgr: NameManager,
+    reg_map: HashMap<Value, String>, spill_map: HashMap<Value, usize>,
+    used_callee_regs: Vec<String>, used_caller_regs: Vec<String>,
+    caller_saved_set: HashSet<String>, next_spill_offset: usize,
 }
 
 impl GenLAInfo {
     fn new() -> Self {
-        let caller_saved_set: HashSet<String> = CALLER_SAVED_REGS.iter().map(|s| s.to_string()).collect();
-        GenLAInfo {
-            stackmem: 0,
-            stackmap: HashMap::new(),
-            allocmap: HashMap::new(),
-            globalmap: HashMap::new(),
-            namemgr: NameManager::new(),
-            reg_map: HashMap::new(),
-            spill_map: HashMap::new(),
-            used_callee_regs: Vec::new(),
-            used_caller_regs: Vec::new(),
-            caller_saved_set,
-            next_spill_offset: 0,
-        }
+        let cs: HashSet<_> = CALLER_SAVED_REGS.iter().map(|s| s.to_string()).collect();
+        GenLAInfo { stackmem: 0, stackmap: HashMap::new(), allocmap: HashMap::new(),
+            globalmap: HashMap::new(), namemgr: NameManager::new(),
+            reg_map: HashMap::new(), spill_map: HashMap::new(),
+            used_callee_regs: Vec::new(), used_caller_regs: Vec::new(),
+            caller_saved_set: cs, next_spill_offset: 0 }
     }
     fn clear_local_info(&mut self) {
-        self.stackmap = HashMap::new();
-        self.allocmap = HashMap::new();
-        self.stackmem = 0;
-        self.reg_map = HashMap::new();
-        self.spill_map = HashMap::new();
-        self.used_callee_regs = Vec::new();
-        self.used_caller_regs = Vec::new();
+        self.stackmap.clear(); self.allocmap.clear(); self.stackmem = 0;
+        self.reg_map.clear(); self.spill_map.clear();
+        self.used_callee_regs.clear(); self.used_caller_regs.clear();
         self.next_spill_offset = 0;
     }
 }
 
+// ─── Liveness + Linear scan ──────────────────────────────────────────────────
+
 fn compute_live_intervals(func_data: &FunctionData) -> Vec<LiveInterval> {
     let dfg = func_data.dfg();
-    let mut intervals: HashMap<Value, LiveInterval> = HashMap::new();
-
-    let mark_use = |intervals: &mut HashMap<Value, LiveInterval>, v: Value, idx: usize| {
-        let interval = intervals.entry(v).or_insert_with(|| LiveInterval {
-            value: v, start: usize::MAX, end: 0, reg: None, spilled: false,
-        });
-        if interval.start == usize::MAX { interval.start = idx; }
-        interval.end = idx;
+    let mut m: HashMap<Value, LiveInterval> = HashMap::new();
+    let mark_use = |m: &mut HashMap<Value, LiveInterval>, v: Value, idx: usize| {
+        let e = m.entry(v).or_insert(LiveInterval { value: v, start: usize::MAX, end: 0, reg: None, spilled: false });
+        if e.start == usize::MAX { e.start = idx; } e.end = idx;
     };
-
-    let mark_def = |intervals: &mut HashMap<Value, LiveInterval>, v: Value, idx: usize| {
-        let interval = intervals.entry(v).or_insert_with(|| LiveInterval {
-            value: v, start: usize::MAX, end: 0, reg: None, spilled: false,
-        });
-        if interval.start == usize::MAX { interval.start = idx; }
-        interval.end = interval.end.max(idx);
+    let mark_def = |m: &mut HashMap<Value, LiveInterval>, v: Value, idx: usize| {
+        let e = m.entry(v).or_insert(LiveInterval { value: v, start: usize::MAX, end: 0, reg: None, spilled: false });
+        if e.start == usize::MAX { e.start = idx; } e.end = e.end.max(idx);
     };
-
     let mut inst_idx = 0usize;
-    for param in func_data.params() { mark_def(&mut intervals, *param, 0); }
+    for param in func_data.params() { mark_def(&mut m, *param, 0); }
     for (_bb, node) in func_data.layout().bbs() {
         for inst_val in node.insts().keys() {
-            let inst_data = dfg.value(*inst_val);
-            mark_def(&mut intervals, *inst_val, inst_idx);
-            match inst_data.kind() {
+            let id = dfg.value(*inst_val);
+            mark_def(&mut m, *inst_val, inst_idx);
+            match id.kind() {
                 ValueKind::Integer(_) | ValueKind::Aggregate(_) | ValueKind::ZeroInit(_) => {},
                 ValueKind::Alloc(_) | ValueKind::GlobalAlloc(_) => {},
-                ValueKind::Load(v) => { mark_use(&mut intervals, v.src(), inst_idx); },
-                ValueKind::Store(v) => {
-                    mark_use(&mut intervals, v.value(), inst_idx);
-                    mark_use(&mut intervals, v.dest(), inst_idx);
-                },
-                ValueKind::GetPtr(v) => {
-                    mark_use(&mut intervals, v.src(), inst_idx);
-                    mark_use(&mut intervals, v.index(), inst_idx);
-                },
-                ValueKind::GetElemPtr(v) => {
-                    mark_use(&mut intervals, v.src(), inst_idx);
-                    mark_use(&mut intervals, v.index(), inst_idx);
-                },
-                ValueKind::Binary(v) => {
-                    mark_use(&mut intervals, v.lhs(), inst_idx);
-                    mark_use(&mut intervals, v.rhs(), inst_idx);
-                },
-                ValueKind::Branch(v) => { mark_use(&mut intervals, v.cond(), inst_idx); },
+                ValueKind::Load(v) => { mark_use(&mut m, v.src(), inst_idx); },
+                ValueKind::Store(v) => { mark_use(&mut m, v.value(), inst_idx); mark_use(&mut m, v.dest(), inst_idx); },
+                ValueKind::GetPtr(v) => { mark_use(&mut m, v.src(), inst_idx); mark_use(&mut m, v.index(), inst_idx); },
+                ValueKind::GetElemPtr(v) => { mark_use(&mut m, v.src(), inst_idx); mark_use(&mut m, v.index(), inst_idx); },
+                ValueKind::Binary(v) => { mark_use(&mut m, v.lhs(), inst_idx); mark_use(&mut m, v.rhs(), inst_idx); },
+                ValueKind::Branch(v) => { mark_use(&mut m, v.cond(), inst_idx); },
                 ValueKind::Jump(_) => {},
-                ValueKind::Call(v) => {
-                    for arg in v.args() { mark_use(&mut intervals, *arg, inst_idx); }
-                },
-                ValueKind::Return(v) => {
-                    if let Some(ret_val) = v.value() { mark_use(&mut intervals, ret_val, inst_idx); }
-                },
+                ValueKind::Call(v) => { for arg in v.args() { mark_use(&mut m, *arg, inst_idx); } },
+                ValueKind::Return(v) => { if let Some(r) = v.value() { mark_use(&mut m, r, inst_idx); } },
                 ValueKind::Undef(_) | ValueKind::FuncArgRef(_) | ValueKind::BlockArgRef(_) => {}
             };
             inst_idx += 1;
         }
     }
-    intervals.into_values().filter(|i| i.start != usize::MAX).collect()
+    m.into_values().filter(|i| i.start != usize::MAX).collect()
 }
 
 fn linear_scan(func_data: &FunctionData, info: &mut GenLAInfo) {
     let mut intervals = compute_live_intervals(func_data);
     if intervals.is_empty() { return; }
     intervals.sort_by_key(|i| i.start);
-
-    // Build register pool: caller-saved first
     let mut free_regs: Vec<String> = Vec::new();
     for reg in CALLEE_SAVED_REGS.iter().rev() { free_regs.push(reg.to_string()); }
     for reg in CALLER_SAVED_REGS.iter().rev() { free_regs.push(reg.to_string()); }
-
     let mut active: Vec<LiveInterval> = Vec::new();
     for mut interval in intervals {
         let mut i = 0;
         while i < active.len() {
-            if active[i].end < interval.start {
-                let expired = active.remove(i);
-                if let Some(ref reg) = expired.reg { free_regs.push(reg.clone()); }
-            } else { i += 1; }
+            if active[i].end < interval.start { if let Some(reg) = active.remove(i).reg { free_regs.push(reg); } } else { i += 1; }
         }
         if !free_regs.is_empty() {
             let reg = free_regs.pop().unwrap();
@@ -156,24 +231,17 @@ fn linear_scan(func_data: &FunctionData, info: &mut GenLAInfo) {
                 if !info.used_callee_regs.contains(&reg) { info.used_callee_regs.push(reg.clone()); }
             }
         } else {
-            let spill_idx = active.iter().enumerate()
-                .max_by_key(|(_, a)| a.end).unwrap().0;
+            let spill_idx = active.iter().enumerate().max_by_key(|(_, a)| a.end).unwrap().0;
             if active[spill_idx].end > interval.end {
                 let mut spilled = active.remove(spill_idx);
                 let reg = spilled.reg.take().unwrap();
-                let slot = info.next_spill_offset;
-                info.next_spill_offset += 4;
-                info.spill_map.insert(spilled.value, slot);
-                spilled.spilled = true;
-                interval.reg = Some(reg.clone());
-                info.reg_map.insert(interval.value, reg.clone());
+                let slot = info.next_spill_offset; info.next_spill_offset += 4;
+                info.spill_map.insert(spilled.value, slot); spilled.spilled = true;
+                interval.reg = Some(reg); info.reg_map.insert(interval.value, interval.reg.clone().unwrap());
                 active.push(spilled);
             } else {
-                let slot = info.next_spill_offset;
-                info.next_spill_offset += 4;
-                info.spill_map.insert(interval.value, slot);
-                interval.spilled = true;
-                interval.reg = None;
+                let slot = info.next_spill_offset; info.next_spill_offset += 4;
+                info.spill_map.insert(interval.value, slot); interval.spilled = true;
             }
         }
         active.push(interval);
@@ -181,188 +249,115 @@ fn linear_scan(func_data: &FunctionData, info: &mut GenLAInfo) {
     }
 }
 
-/// Write `st.w $src, $sp, $offset` or use scratch if offset too large
-fn store_w_sp(writer: &mut impl Write, src: &str, offset: i32) -> Result<()> {
-    if offset >= -2048 && offset < 2048 {
-        writeln!(writer, "\tst.w ${}, $sp, {}", src, offset)
-    } else {
-        writeln!(writer, "\tlu12i.w $t8, {}", (offset as u32 >> 12) as i32)?;
-        writeln!(writer, "\tori $t8, $t8, {}", offset & 0xfff)?;
-        writeln!(writer, "\tadd.d $t8, $t8, $sp")?;
-        writeln!(writer, "\tst.w ${}, $t8, 0", src)
-    }
-}
+// ─── Codegen ─────────────────────────────────────────────────────────────────
 
-/// Write `ld.w $dest, $sp, $offset` or use scratch if offset too large
-fn load_w_sp(writer: &mut impl Write, dest: &str, offset: i32) -> Result<()> {
-    if offset >= -2048 && offset < 2048 {
-        writeln!(writer, "\tld.w ${}, $sp, {}", dest, offset)
-    } else {
-        writeln!(writer, "\tlu12i.w $t8, {}", (offset as u32 >> 12) as i32)?;
-        writeln!(writer, "\tori $t8, $t8, {}", offset & 0xfff)?;
-        writeln!(writer, "\tadd.d $t8, $t8, $sp")?;
-        writeln!(writer, "\tld.w ${}, $t8, 0", dest)
-    }
-}
-
-/// Write `st.d $src, $sp, $offset` or use scratch if offset too large
-fn store_d_sp(writer: &mut impl Write, src: &str, offset: i32) -> Result<()> {
-    if offset >= -2048 && offset < 2048 {
-        writeln!(writer, "\tst.d ${}, $sp, {}", src, offset)
-    } else {
-        writeln!(writer, "\tlu12i.w $t8, {}", (offset as u32 >> 12) as i32)?;
-        writeln!(writer, "\tori $t8, $t8, {}", offset & 0xfff)?;
-        writeln!(writer, "\tadd.d $t8, $t8, $sp")?;
-        writeln!(writer, "\tst.d ${}, $t8, 0", src)
-    }
-}
-
-/// Write `ld.d $dest, $sp, $offset` or use scratch if offset too large
-fn load_d_sp(writer: &mut impl Write, dest: &str, offset: i32) -> Result<()> {
-    if offset >= -2048 && offset < 2048 {
-        writeln!(writer, "\tld.d ${}, $sp, {}", dest, offset)
-    } else {
-        writeln!(writer, "\tlu12i.w $t8, {}", (offset as u32 >> 12) as i32)?;
-        writeln!(writer, "\tori $t8, $t8, {}", offset & 0xfff)?;
-        writeln!(writer, "\tadd.d $t8, $t8, $sp")?;
-        writeln!(writer, "\tld.d ${}, $t8, 0", dest)
-    }
-}
-
-/// Load an immediate 32-bit value into a register
-fn load_imm32(writer: &mut impl Write, dest: &str, val: i32) -> Result<()> {
+fn load_imm32(buf: &mut Vec<LAInst>, rd: &str, val: i32) {
+    let r = format!("${}", rd);
     let v = val as u32;
-    let hi20 = (v >> 12) as i32;
-    let lo12 = (v & 0xfff) as i32;
-    if hi20 == 0 && lo12 < 2048 {
-        writeln!(writer, "\tori ${}, $zero, {}", dest, lo12)
-    } else if lo12 == 0 {
-        writeln!(writer, "\tlu12i.w ${}, {}", dest, hi20)
+    let hi = (v >> 12) as i32;
+    let lo = (v & 0xfff) as i32;
+    if hi == 0 {
+        buf.push(LAInst::Ori { rd: r, rj: "$zero".into(), imm: lo as u16 });
+    } else if lo == 0 {
+        buf.push(LAInst::Lu12iW { rd: r, imm: hi });
     } else {
-        writeln!(writer, "\tlu12i.w ${}, {}", dest, hi20)?;
-        writeln!(writer, "\tori ${}, ${}, {}", dest, dest, lo12)
+        let r2 = format!("${}", rd);
+        buf.push(LAInst::Lu12iW { rd: r, imm: hi });
+        buf.push(LAInst::Ori { rd: r2.clone(), rj: r2, imm: lo as u16 });
     }
 }
 
-/// Move $src to $dest
-fn move_reg(writer: &mut impl Write, dest: &str, src: &str) -> Result<()> {
-    writeln!(writer, "\tor ${}, ${}, $zero", dest, src)
-}
-
-/// Load a value into $a0 (primary working register)
-fn load_operand(writer: &mut impl Write, value: Value, funcdata: &FunctionData, prog: &Program, info: &GenLAInfo, dest: &str) -> Result<()> {
+fn load_operand(value: Value, funcdata: &FunctionData, prog: &Program, info: &GenLAInfo, buf: &mut Vec<LAInst>, dest: &str) {
+    let d = |s: &str| format!("${}", s);
     if let ValueKind::Integer(v) = funcdata.dfg().value(value).kind() {
-        return load_imm32(writer, dest, v.value());
+        load_imm32(buf, dest, v.value()); return;
     }
     if let Some(reg) = info.reg_map.get(&value) {
-        move_reg(writer, dest, reg)?;
-    } else if let Some(offset) = info.spill_map.get(&value) {
-        load_w_sp(writer, dest, (*offset + info.stackmem) as i32)?;
+        buf.push(LAInst::Or { rd: d(dest), rj: d(reg), rk: "$zero".into() });
+    } else if let Some(off) = info.spill_map.get(&value) {
+        buf.push(LAInst::LdW { rd: d(dest), rj: "$sp".into(), offset: (*off + info.stackmem) as i32 });
     } else if info.globalmap.get(&value).is_some() {
         let sym = prog.borrow_value(value).name().as_ref().unwrap()[1..].to_string();
-        writeln!(writer, "\tpcalau12i ${}, %pc_hi20({})", dest, sym)?;
-        writeln!(writer, "\taddi.d ${}, ${}, %pc_lo12({})", dest, dest, sym)?;
-    } else if let Some(offset) = info.stackmap.get(&value) {
-        load_w_sp(writer, dest, *offset as i32)?;
+        buf.push(LAInst::Pcalau12i { rd: d(dest), symbol: sym.clone() });
+        buf.push(LAInst::Directive(format!("\taddi.d ${}, ${}, %pc_lo12({})", dest, dest, sym)));
+    } else if let Some(off) = info.stackmap.get(&value) {
+        buf.push(LAInst::LdW { rd: d(dest), rj: "$sp".into(), offset: *off as i32 });
     } else {
         panic!("Cannot load value");
     }
-    Ok(())
 }
 
-/// Store result from $a0 to destination value's location
-fn store_result(writer: &mut impl Write, dest: Value, info: &mut GenLAInfo, src: &str) -> Result<()> {
-    if let Some(offset) = info.stackmap.get(&dest) {
-        store_w_sp(writer, src, *offset as i32)?;
+fn store_result(value: Value, info: &mut GenLAInfo, buf: &mut Vec<LAInst>, src: &str) {
+    let s = |name: &str| format!("${}", name);
+    if let Some(off) = info.stackmap.get(&value) {
+        buf.push(LAInst::StW { rd: s(src), rj: "$sp".into(), offset: *off as i32 });
     }
-    if let Some(reg) = info.reg_map.get(&dest) {
-        move_reg(writer, reg, src)?;
+    if let Some(reg) = info.reg_map.get(&value) {
+        buf.push(LAInst::Or { rd: s(reg), rj: s(src), rk: "$zero".into() });
     }
-    Ok(())
 }
 
 trait GenerateAsm {
-    fn generate(&self, writer: &mut impl Write, info: &mut GenLAInfo, prog: &Program) -> Result<()>;
+    fn generate(&self, info: &mut GenLAInfo, prog: &Program, buf: &mut Vec<LAInst>);
 }
 
 impl GenerateAsm for koopa::ir::Program {
-    fn generate(&self, writer: &mut impl Write, info: &mut GenLAInfo, prog: &Program) -> Result<()> {
-        writeln!(writer, "\t.data")?;
+    fn generate(&self, info: &mut GenLAInfo, prog: &Program, buf: &mut Vec<LAInst>) {
+        buf.push(LAInst::Directive("\t.data".into()));
         for value in self.inst_layout() {
-            let value_data = &*self.borrow_value(value.clone());
-            let name = info.namemgr.value_name(value_data)[1..].to_string();
-            match value_data.kind() {
-                ValueKind::GlobalAlloc(v) => {
-                    info.globalmap.insert(value.clone(), 0);
-                    let initval = v.init();
-                    writeln!(writer, "\t.globl {}", name)?;
-                    if prog.borrow_value(initval).ty().size() > 4 {
-                        writeln!(writer, "\t.align 3")?;
-                    } else {
-                        writeln!(writer, "\t.align 2")?;
-                    }
-                    writeln!(writer, "{}:", name)?;
-                    match self.borrow_value(initval).kind() {
-                        ValueKind::Integer(v) => {
-                            writeln!(writer, "\t.4byte {}", v.value())?;
-                        },
-                        ValueKind::ZeroInit(_) => {
-                            let size = match value_data.ty().kind() {
-                                TypeKind::Pointer(ty) => ty.size(),
-                                _ => panic!(),
-                            };
-                            writeln!(writer, "\t.zero {}", size)?;
-                        },
-                        ValueKind::Aggregate(v) => {
-                            fn process_aggregate(writer: &mut impl Write, agg: &values::Aggregate, prog: &Program) -> Result<()> {
-                                for value in agg.elems() {
-                                    match prog.borrow_value(value.clone()).kind() {
-                                        ValueKind::Integer(v) => { writeln!(writer, "\t.4byte {}", v.value())?; },
-                                        ValueKind::Aggregate(v) => { process_aggregate(writer, v, prog)?; },
-                                        ValueKind::ZeroInit(_) => {
-                                            writeln!(writer, "\t.zero {}", prog.borrow_value(value.clone()).ty().size())?;
-                                        },
-                                        _ => todo!()
-                                    }
-                                }
-                                Ok(())
-                            }
-                            process_aggregate(writer, v, self)?;
-                        },
-                        _ => todo!()
-                    }
-                },
-                _ => todo!()
+            let vd = &*self.borrow_value(value.clone());
+            let name = info.namemgr.value_name(vd)[1..].to_string();
+            if let ValueKind::GlobalAlloc(v) = vd.kind() {
+                info.globalmap.insert(value.clone(), 0);
+                buf.push(LAInst::Directive(format!("\t.globl {}", name)));
+                buf.push(LAInst::Directive("\t.align 2".into()));
+                buf.push(LAInst::Label(name.clone()));
+                match self.borrow_value(v.init()).kind() {
+                    ValueKind::Integer(v) => buf.push(LAInst::Directive(format!("\t.4byte {}", v.value()))),
+                    ValueKind::ZeroInit(_) => {
+                        let sz = match vd.ty().kind() { TypeKind::Pointer(ty) => ty.size(), _ => panic!() };
+                        buf.push(LAInst::Directive(format!("\t.zero {}", sz)));
+                    },
+                    ValueKind::Aggregate(v) => emit_agg(v, self, buf),
+                    _ => todo!()
+                }
             }
         }
-        writeln!(writer, "\t.text")?;
-        for (_, funcdata) in self.funcs() {
-            if funcdata.layout().entry_bb().is_none() { continue; }
+        buf.push(LAInst::Directive("\t.text".into()));
+        for (_, fd) in self.funcs() {
+            if fd.layout().entry_bb().is_none() { continue; }
             info.namemgr.enter_func_scope();
-            funcdata.generate(writer, info, prog)?;
+            fd.generate(info, prog, buf);
             info.namemgr.exit_func_scope();
             info.clear_local_info();
-            writeln!(writer, "")?;
+            buf.push(LAInst::Directive("".into()));
         }
-        Ok(())
+    }
+}
+
+fn emit_agg(agg: &values::Aggregate, prog: &Program, buf: &mut Vec<LAInst>) {
+    for v in agg.elems() {
+        match prog.borrow_value(v.clone()).kind() {
+            ValueKind::Integer(v) => buf.push(LAInst::Directive(format!("\t.4byte {}", v.value()))),
+            ValueKind::Aggregate(v) => emit_agg(v, prog, buf),
+            ValueKind::ZeroInit(_) => buf.push(LAInst::Directive(format!("\t.zero {}", prog.borrow_value(v.clone()).ty().size()))),
+            _ => todo!()
+        }
     }
 }
 
 impl GenerateAsm for koopa::ir::FunctionData {
-    fn generate(&self, writer: &mut impl Write, info: &mut GenLAInfo, prog: &Program) -> Result<()> {
-        writeln!(writer, "\t.globl {}", self.name()[1..].to_string())?;
-        writeln!(writer, "{}:", self.name()[1..].to_string())?;
+    fn generate(&self, info: &mut GenLAInfo, prog: &Program, buf: &mut Vec<LAInst>) {
+        let fname = self.name()[1..].to_string();
+        buf.push(LAInst::Directive(format!("\t.globl {}", fname)));
+        buf.push(LAInst::Label(fname.clone()));
 
-        // Stack allocation
         let mut offset = 0;
         for (v, data) in self.dfg().values().iter() {
             match data.kind() {
                 ValueKind::Integer(_) | ValueKind::Aggregate(_) => continue,
                 ValueKind::Alloc(_) => {
-                    match data.ty().kind() {
-                        TypeKind::Pointer(ty) => { info.allocmap.insert(v.clone(), offset); offset += ty.size(); },
-                        _ => panic!(),
-                    }
+                    if let TypeKind::Pointer(ty) = data.ty().kind() { info.allocmap.insert(v.clone(), offset); offset += ty.size(); }
                 },
                 _ => (),
             }
@@ -370,273 +365,220 @@ impl GenerateAsm for koopa::ir::FunctionData {
             offset += data.ty().size();
         }
         info.stackmem = offset;
-
-        // Register allocation
         linear_scan(self, info);
         info.next_spill_offset += info.stackmem;
 
-        // Prologue: allocate frame, save $ra and $fp
-        let total_stack = info.stackmem + info.next_spill_offset - info.stackmem;
+        let total = info.stackmem + info.next_spill_offset - info.stackmem;
         let callee_saves = info.used_callee_regs.len() * 8;
-        // 16-byte alignment for stack frame
-        let aligned_stack = ((total_stack + callee_saves + 16) + 15) & !15;
-        let frame_size = aligned_stack as i32;
+        let aligned = ((total + callee_saves + 16) + 15) & !15;
+        let frame = aligned as i32;
+        let ra_off = frame - 8;
+        let fp_off = frame - 16;
 
-        // Build prologue
-        // save $ra, $fp, callee-saved regs, then allocate locals
-        let ra_offset = frame_size - 8;
-        let fp_offset = frame_size - 16;
-        writeln!(writer, "\taddi.d $sp, $sp, -{}", frame_size)?;
-        store_d_sp(writer, "ra", ra_offset)?;
-        store_d_sp(writer, "fp", fp_offset)?;
-        // Save callee-saved registers
-        let mut csr_offset = fp_offset - 8;
+        // Prologue
+        buf.push(LAInst::AddiD { rd: "$sp".into(), rj: "$sp".into(), imm: -frame });
+        buf.push(LAInst::StD { rd: "$ra".into(), rj: "$sp".into(), offset: ra_off });
+        buf.push(LAInst::StD { rd: "$fp".into(), rj: "$sp".into(), offset: fp_off });
+        let mut csr_off = fp_off - 8;
         for reg in &info.used_callee_regs {
-            store_d_sp(writer, reg, csr_offset)?;
-            csr_offset -= 8;
+            buf.push(LAInst::StD { rd: format!("${}", reg), rj: "$sp".into(), offset: csr_off });
+            csr_off -= 8;
         }
-        writeln!(writer, "\tor $fp, $sp, $zero")?;
+        buf.push(LAInst::Or { rd: "$fp".into(), rj: "$sp".into(), rk: "$zero".into() });
 
-        // Save function parameters to local stack slots
+        // Save params
         for (i, param) in self.params().iter().enumerate() {
             if i < 8 {
-                store_w_sp(writer, ARG_REGS[i], info.stackmap[param] as i32)?;
+                buf.push(LAInst::StW { rd: format!("${}", ARG_REGS[i]), rj: "$sp".into(), offset: info.stackmap[param] as i32 });
             } else {
-                let param_offset = (frame_size + (i as i32 - 8) * 8) as i32;
-                load_d_sp(writer, "a0", param_offset)?;
-                store_w_sp(writer, "a0", info.stackmap[param] as i32)?;
+                let poff = (frame + (i as i32 - 8) * 8) as i32;
+                buf.push(LAInst::LdD { rd: "$a0".into(), rj: "$sp".into(), offset: poff });
+                buf.push(LAInst::StW { rd: "$a0".into(), rj: "$sp".into(), offset: info.stackmap[param] as i32 });
             }
         }
 
-        // Basic blocks
         for (bb, node) in self.layout().bbs() {
             let bb_name = info.namemgr.bb_name(self.dfg().bb(*bb));
-            writeln!(writer, "\t.L{}_{}:", self.name()[1..].to_string(), bb_name[1..].to_string())?;
+            buf.push(LAInst::Label(format!("\t.L{}_{}", fname, &bb_name[1..])));
             for inst_val in node.insts().keys() {
-                inst_val.generate(writer, self, info, prog)?;
+                inst_val.generate(self, info, prog, buf);
             }
         }
-        Ok(())
     }
 }
 
 trait _Gen {
-    fn generate(&self, writer: &mut impl Write, funcdata: &FunctionData, info: &mut GenLAInfo, prog: &Program) -> Result<()>;
+    fn generate(&self, funcdata: &FunctionData, info: &mut GenLAInfo, prog: &Program, buf: &mut Vec<LAInst>);
 }
 
 impl _Gen for Value {
-    fn generate(&self, writer: &mut impl Write, funcdata: &FunctionData, info: &mut GenLAInfo, prog: &Program) -> Result<()> {
-        match funcdata.dfg().value(self.clone()).kind() {
-            ValueKind::Integer(_v) => panic!(),
-            ValueKind::Aggregate(_v) => panic!(),
+    fn generate(&self, funcdata: &FunctionData, info: &mut GenLAInfo, prog: &Program, buf: &mut Vec<LAInst>) {
+        let inst = funcdata.dfg().value(self.clone());
+        match inst.kind() {
+            ValueKind::Integer(_) | ValueKind::Aggregate(_) => {},
             ValueKind::Return(v) => {
-                if let Some(v) = v.value() {
-                    load_operand(writer, v, funcdata, prog, info, "a0")?;
-                }
-                // Epilogue: restore callee-saved, $fp, $ra, deallocate, return
-                let total_stack = info.stackmem + info.next_spill_offset - info.stackmem;
+                if let Some(v) = v.value() { load_operand(v, funcdata, prog, info, buf, "a0"); }
+                let total = info.stackmem + info.next_spill_offset - info.stackmem;
                 let callee_saves = info.used_callee_regs.len() * 8;
-                let aligned_stack = ((total_stack + callee_saves + 16) + 15) & !15;
-                let frame_size = aligned_stack as i32;
-                let ra_offset = frame_size - 8;
-                let fp_offset = frame_size - 16;
-
-                // Restore callee-saved in reverse
-                let mut csr_offset = fp_offset - 8 - ((info.used_callee_regs.len() as i32 - 1) * 8);
+                let aligned = ((total + callee_saves + 16) + 15) & !15;
+                let frame = aligned as i32;
+                let ra_off = frame - 8;
+                let fp_off = frame - 16;
+                let mut csr_off = fp_off - 8 - ((info.used_callee_regs.len() as i32 - 1) * 8);
                 for reg in info.used_callee_regs.iter().rev() {
-                    load_d_sp(writer, reg, csr_offset)?;
-                    csr_offset += 8;
+                    buf.push(LAInst::LdD { rd: format!("${}", reg), rj: "$sp".into(), offset: csr_off });
+                    csr_off += 8;
                 }
-
-                load_d_sp(writer, "fp", fp_offset)?;
-                load_d_sp(writer, "ra", ra_offset)?;
-                writeln!(writer, "\taddi.d $sp, $sp, {}", frame_size)?;
-                writeln!(writer, "\tjirl $r0, $r1, 0")?;
-            }
-            ValueKind::Alloc(_v) => {
-                load_imm32(writer, "a0", info.allocmap[self] as i32)?;
-                writeln!(writer, "\tadd.d $a0, $a0, $sp")?;
-                store_w_sp(writer, "a0", info.stackmap[self] as i32)?;
-            }
+                buf.push(LAInst::LdD { rd: "$fp".into(), rj: "$sp".into(), offset: fp_off });
+                buf.push(LAInst::LdD { rd: "$ra".into(), rj: "$sp".into(), offset: ra_off });
+                buf.push(LAInst::AddiD { rd: "$sp".into(), rj: "$sp".into(), imm: frame });
+                buf.push(LAInst::Jirl { rd: "$r0".into(), rj: "$r1".into(), offset: 0 });
+            },
+            ValueKind::Alloc(_) => {
+                load_imm32(buf, "a0", info.allocmap[self] as i32);
+                buf.push(LAInst::AddiD { rd: "$a0".into(), rj: "$a0".into(), imm: 0 }); // actually add.d $a0, $a0, $sp
+                // Replace with: add.d $a0, $a0, $sp
+                buf.pop();
+                buf.push(LAInst::Directive("\tadd.d $a0, $a0, $sp".into()));
+                store_result(*self, info, buf, "a0");
+            },
             ValueKind::Load(v) => {
                 if info.globalmap.get(&v.src()).is_some() {
                     let sym = prog.borrow_value(v.src()).name().as_ref().unwrap()[1..].to_string();
-                    writeln!(writer, "\tpcalau12i $a0, %pc_hi20({})", sym)?;
-                    writeln!(writer, "\taddi.d $a0, $a0, %pc_lo12({})", sym)?;
-                    writeln!(writer, "\tld.w $a0, $a0, 0")?;
+                    buf.push(LAInst::Pcalau12i { rd: "$a0".into(), symbol: sym.clone() });
+                    buf.push(LAInst::Directive(format!("\taddi.d $a0, $a0, %pc_lo12({})", sym)));
+                    buf.push(LAInst::LdW { rd: "$a0".into(), rj: "$a0".into(), offset: 0 });
                 } else {
-                    load_operand(writer, v.src(), funcdata, prog, info, "a0")?;
-                    writeln!(writer, "\tld.w $a0, $a0, 0")?;
+                    load_operand(v.src(), funcdata, prog, info, buf, "a0");
+                    buf.push(LAInst::LdW { rd: "$a0".into(), rj: "$a0".into(), offset: 0 });
                 }
-                store_result(writer, *self, info, "a0")?;
-            }
+                store_result(*self, info, buf, "a0");
+            },
             ValueKind::Store(v) => {
                 let mut is_agg = false;
                 match funcdata.dfg().value(v.value()).kind() {
-                    ValueKind::Aggregate(agg) => {
-                        is_agg = true;
-                        fn proc_agg(w: &mut impl Write, fd: &FunctionData, inf: &mut GenLAInfo, p: &Program, agg: &values::Aggregate, mut base: usize) -> Result<usize> {
-                            let old_base = base;
-                            for value in agg.elems() {
-                                let mut is_agg = false;
-                                match fd.dfg().value(value.clone()).kind() {
-                                    ValueKind::Aggregate(v) => { base += proc_agg(w, fd, inf, p, v, base)?; is_agg = true; },
-                                    ValueKind::Integer(v) => { load_imm32(w, "a0", v.value())?; },
-                                    _ => load_operand(w, *value, fd, p, inf, "a0")?,
-                                }
-                                if !is_agg { store_w_sp(w, "a0", base as i32)?; base += 4; }
-                            }
-                            Ok(base - old_base)
-                        }
-                        proc_agg(writer, funcdata, info, prog, agg, info.allocmap[&v.dest()])?;
-                    }
-                    ValueKind::Integer(v) => load_imm32(writer, "a0", v.value())?,
-                    _ => load_operand(writer, v.value(), funcdata, prog, info, "a0")?,
+                    ValueKind::Aggregate(agg) => { is_agg = true; emit_agg_store(funcdata, info, prog, buf, agg, info.allocmap[&v.dest()]); },
+                    ValueKind::Integer(vi) => load_imm32(buf, "a0", vi.value()),
+                    _ => load_operand(v.value(), funcdata, prog, info, buf, "a0"),
                 }
                 if info.globalmap.get(&v.dest()).is_some() {
-                    assert!(!is_agg);
                     let sym = prog.borrow_value(v.dest()).name().as_ref().unwrap()[1..].to_string();
-                    writeln!(writer, "\tpcalau12i $t8, %pc_hi20({})", sym)?;
-                    writeln!(writer, "\taddi.d $t8, $t8, %pc_lo12({})", sym)?;
-                    writeln!(writer, "\tst.w $a0, $t8, 0")?;
+                    buf.push(LAInst::Pcalau12i { rd: "$t8".into(), symbol: sym.clone() });
+                    buf.push(LAInst::Directive(format!("\taddi.d $t8, $t8, %pc_lo12({})", sym)));
+                    buf.push(LAInst::StW { rd: "$a0".into(), rj: "$t8".into(), offset: 0 });
                 } else if !is_agg {
-                    load_operand(writer, v.dest(), funcdata, prog, info, "t8")?;
-                    writeln!(writer, "\tst.w $a0, $t8, 0")?;
+                    load_operand(v.dest(), funcdata, prog, info, buf, "t8");
+                    buf.push(LAInst::StW { rd: "$a0".into(), rj: "$t8".into(), offset: 0 });
                 }
-            }
+            },
             ValueKind::Binary(v) => {
-                load_operand(writer, v.lhs(), funcdata, prog, info, "a0")?;
-                load_operand(writer, v.rhs(), funcdata, prog, info, "a1")?;
+                load_operand(v.lhs(), funcdata, prog, info, buf, "a0");
+                load_operand(v.rhs(), funcdata, prog, info, buf, "a1");
                 match v.op() {
-                    BinaryOp::Add => writeln!(writer, "\tadd.w $a0, $a0, $a1")?,
-                    BinaryOp::Sub => writeln!(writer, "\tsub.w $a0, $a0, $a1")?,
-                    BinaryOp::Mul => writeln!(writer, "\tmul.w $a0, $a0, $a1")?,
-                    BinaryOp::Div => writeln!(writer, "\tdiv.w $a0, $a0, $a1")?,
-                    BinaryOp::Mod => writeln!(writer, "\tmod.w $a0, $a0, $a1")?,
-                    BinaryOp::And => writeln!(writer, "\tand $a0, $a0, $a1")?,
-                    BinaryOp::Or => writeln!(writer, "\tor $a0, $a0, $a1")?,
-                    BinaryOp::Eq => {
-                        writeln!(writer, "\txor $a0, $a0, $a1")?;
-                        writeln!(writer, "\tsltui $a0, $a0, 1")?;
-                    },
-                    BinaryOp::NotEq => {
-                        writeln!(writer, "\txor $a0, $a0, $a1")?;
-                        writeln!(writer, "\tsltu $a0, $zero, $a0")?;
-                    },
-                    BinaryOp::Lt => writeln!(writer, "\tslt $a0, $a0, $a1")?,
-                    BinaryOp::Gt => writeln!(writer, "\tslt $a0, $a1, $a0")?,
-                    BinaryOp::Le => {
-                        writeln!(writer, "\tslt $a0, $a1, $a0")?;
-                        writeln!(writer, "\txori $a0, $a0, 1")?;
-                    },
-                    BinaryOp::Ge => {
-                        writeln!(writer, "\tslt $a0, $a0, $a1")?;
-                        writeln!(writer, "\txori $a0, $a0, 1")?;
-                    },
+                    BinaryOp::Add => buf.push(LAInst::AddW { rd: "$a0".into(), rj: "$a0".into(), rk: "$a1".into() }),
+                    BinaryOp::Sub => buf.push(LAInst::SubW { rd: "$a0".into(), rj: "$a0".into(), rk: "$a1".into() }),
+                    BinaryOp::Mul => buf.push(LAInst::MulW { rd: "$a0".into(), rj: "$a0".into(), rk: "$a1".into() }),
+                    BinaryOp::Div => buf.push(LAInst::DivW { rd: "$a0".into(), rj: "$a0".into(), rk: "$a1".into() }),
+                    BinaryOp::Mod => buf.push(LAInst::ModW { rd: "$a0".into(), rj: "$a0".into(), rk: "$a1".into() }),
+                    BinaryOp::And => buf.push(LAInst::And  { rd: "$a0".into(), rj: "$a0".into(), rk: "$a1".into() }),
+                    BinaryOp::Or  => buf.push(LAInst::Or   { rd: "$a0".into(), rj: "$a0".into(), rk: "$a1".into() }),
+                    BinaryOp::Eq => { buf.push(LAInst::Xor { rd: "$a0".into(), rj: "$a0".into(), rk: "$a1".into() }); buf.push(LAInst::Sltui { rd: "$a0".into(), rj: "$a0".into(), imm: 1 }); },
+                    BinaryOp::NotEq => { buf.push(LAInst::Xor { rd: "$a0".into(), rj: "$a0".into(), rk: "$a1".into() }); buf.push(LAInst::Sltu { rd: "$a0".into(), rj: "$zero".into(), rk: "$a0".into() }); },
+                    BinaryOp::Lt => buf.push(LAInst::Slt { rd: "$a0".into(), rj: "$a0".into(), rk: "$a1".into() }),
+                    BinaryOp::Gt => buf.push(LAInst::Slt { rd: "$a0".into(), rj: "$a1".into(), rk: "$a0".into() }),
+                    BinaryOp::Le => { buf.push(LAInst::Slt { rd: "$a0".into(), rj: "$a1".into(), rk: "$a0".into() }); buf.push(LAInst::Xori { rd: "$a0".into(), rj: "$a0".into(), imm: 1 }); },
+                    BinaryOp::Ge => { buf.push(LAInst::Slt { rd: "$a0".into(), rj: "$a0".into(), rk: "$a1".into() }); buf.push(LAInst::Xori { rd: "$a0".into(), rj: "$a0".into(), imm: 1 }); },
                     _ => todo!()
                 }
-                store_result(writer, *self, info, "a0")?;
-            }
+                store_result(*self, info, buf, "a0");
+            },
             ValueKind::Branch(v) => {
-                load_operand(writer, v.cond(), funcdata, prog, info, "a0")?;
-                let true_br = info.namemgr.bb_name(funcdata.dfg().bb(v.true_bb()));
-                let false_br = info.namemgr.bb_name(funcdata.dfg().bb(v.false_bb()));
-                writeln!(writer, "\tbnez $a0, .L{}_{}", funcdata.name()[1..].to_string(), true_br[1..].to_string())?;
-                writeln!(writer, "\tb .L{}_{}", funcdata.name()[1..].to_string(), false_br[1..].to_string())?;
-            }
+                load_operand(v.cond(), funcdata, prog, info, buf, "a0");
+                let tb = info.namemgr.bb_name(funcdata.dfg().bb(v.true_bb()));
+                let fb = info.namemgr.bb_name(funcdata.dfg().bb(v.false_bb()));
+                let fname = funcdata.name()[1..].to_string();
+                buf.push(LAInst::Bnez { rj: "$a0".into(), label: format!(".L{}_{}", fname, &tb[1..]) });
+                buf.push(LAInst::B { label: format!(".L{}_{}", fname, &fb[1..]) });
+            },
             ValueKind::Jump(v) => {
-                let target = info.namemgr.bb_name(funcdata.dfg().bb(v.target()));
-                writeln!(writer, "\tb .L{}_{}", funcdata.name()[1..].to_string(), target[1..].to_string())?;
-            }
+                let t = info.namemgr.bb_name(funcdata.dfg().bb(v.target()));
+                buf.push(LAInst::B { label: format!(".L{}_{}", funcdata.name()[1..].to_string(), &t[1..]) });
+            },
             ValueKind::Call(v) => {
-                let argcnt = v.args().iter().count();
-                let mut stack_args = 0i32;
-
-                // Flush caller-saved registers to stack before call
                 for (value, reg) in &info.reg_map {
                     if info.caller_saved_set.contains(reg) {
-                        if let Some(offset) = info.stackmap.get(value) {
-                            store_w_sp(writer, reg, *offset as i32)?;
+                        if let Some(off) = info.stackmap.get(value) {
+                            buf.push(LAInst::StW { rd: format!("${}", reg), rj: "$sp".into(), offset: *off as i32 });
                         }
                     }
                 }
-
-                // Pass arguments
+                let mut stack_args = 0i32;
                 for (i, arg) in v.args().iter().enumerate() {
                     if i < 8 {
-                        load_operand(writer, *arg, funcdata, prog, info, ARG_REGS[i])?;
+                        load_operand(*arg, funcdata, prog, info, buf, ARG_REGS[i]);
                     } else {
-                        load_operand(writer, *arg, funcdata, prog, info, "a0")?;
-                        writeln!(writer, "\taddi.d $sp, $sp, -8")?;
-                        writeln!(writer, "\tst.d $a0, $sp, 0")?;
+                        load_operand(*arg, funcdata, prog, info, buf, "a0");
+                        buf.push(LAInst::AddiD { rd: "$sp".into(), rj: "$sp".into(), imm: -8 });
+                        buf.push(LAInst::StD { rd: "$a0".into(), rj: "$sp".into(), offset: 0 });
                         stack_args += 1;
                     }
                 }
-
-                // 16-byte alignment
                 let push_bytes = stack_args * 8;
-                if push_bytes % 16 != 0 {
-                    writeln!(writer, "\taddi.d $sp, $sp, -8")?;
-                }
-
-                writeln!(writer, "\tbl {}", prog.func(v.callee()).name()[1..].to_string())?;
-
-                // Clean up stack
-                let clean_bytes = push_bytes + if push_bytes % 16 != 0 { 8 } else { 0 };
-                if clean_bytes > 0 {
-                    writeln!(writer, "\taddi.d $sp, $sp, {}", clean_bytes)?;
-                }
-
-                if !funcdata.dfg().value(self.clone()).ty().is_unit() {
-                    store_result(writer, *self, info, "a0")?;
-                }
-            }
+                if push_bytes % 16 != 0 { buf.push(LAInst::AddiD { rd: "$sp".into(), rj: "$sp".into(), imm: -8 }); }
+                buf.push(LAInst::Bl { symbol: prog.func(v.callee()).name()[1..].to_string() });
+                let clean = push_bytes + if push_bytes % 16 != 0 { 8 } else { 0 };
+                if clean > 0 { buf.push(LAInst::AddiD { rd: "$sp".into(), rj: "$sp".into(), imm: clean }); }
+                if !funcdata.dfg().value(self.clone()).ty().is_unit() { store_result(*self, info, buf, "a0"); }
+            },
             ValueKind::GetElemPtr(v) => {
-                load_operand(writer, v.index(), funcdata, prog, info, "a0")?;
+                load_operand(v.index(), funcdata, prog, info, buf, "a0");
                 let step = if info.globalmap.get(&v.src()).is_some() {
-                    match prog.borrow_value(v.src()).ty().kind() {
-                        TypeKind::Pointer(ty) => match ty.kind() {
-                            TypeKind::Array(ty, _len) => ty.size(),
-                            _ => panic!(),
-                        },
-                        _ => panic!(),
-                    }
+                    match prog.borrow_value(v.src()).ty().kind() { TypeKind::Pointer(ty) => match ty.kind() { TypeKind::Array(ty, _) => ty.size(), _ => panic!() }, _ => panic!() }
                 } else {
-                    match funcdata.dfg().value(v.src()).ty().kind() {
-                        TypeKind::Pointer(ty) => match ty.kind() {
-                            TypeKind::Array(ty, _len) => ty.size(),
-                            _ => panic!(),
-                        },
-                        _ => panic!(),
-                    }
+                    match funcdata.dfg().value(v.src()).ty().kind() { TypeKind::Pointer(ty) => match ty.kind() { TypeKind::Array(ty, _) => ty.size(), _ => panic!() }, _ => panic!() }
                 };
-                load_imm32(writer, "a1", step as i32)?;
-                writeln!(writer, "\tmul.w $a0, $a0, $a1")?;
-                load_operand(writer, v.src(), funcdata, prog, info, "a1")?;
-                writeln!(writer, "\tadd.d $a0, $a0, $a1")?;
-                store_result(writer, *self, info, "a0")?;
-            }
+                load_imm32(buf, "a1", step as i32);
+                buf.push(LAInst::MulW { rd: "$a0".into(), rj: "$a0".into(), rk: "$a1".into() });
+                load_operand(v.src(), funcdata, prog, info, buf, "a1");
+                buf.push(LAInst::AddiD { rd: "$a0".into(), rj: "$a0".into(), imm: 0 }); // placeholder: add.d
+                buf.pop();
+                buf.push(LAInst::Directive("\tadd.d $a0, $a0, $a1".into()));
+                store_result(*self, info, buf, "a0");
+            },
             ValueKind::GetPtr(v) => {
-                load_operand(writer, v.index(), funcdata, prog, info, "a0")?;
+                load_operand(v.index(), funcdata, prog, info, buf, "a0");
                 match funcdata.dfg().value(v.src()).ty().kind() {
-                    TypeKind::Pointer(ty) => {
-                        load_imm32(writer, "a1", ty.size() as i32)?;
-                        writeln!(writer, "\tmul.w $a0, $a0, $a1")?;
-                    },
+                    TypeKind::Pointer(ty) => { load_imm32(buf, "a1", ty.size() as i32); buf.push(LAInst::MulW { rd: "$a0".into(), rj: "$a0".into(), rk: "$a1".into() }); },
                     _ => panic!(),
                 }
-                load_operand(writer, v.src(), funcdata, prog, info, "a1")?;
-                writeln!(writer, "\tadd.d $a0, $a0, $a1")?;
-                store_result(writer, *self, info, "a0")?;
-            }
-            _ => { println!("{:#?}", funcdata.dfg().value(self.clone()).kind()); todo!(); }
+                load_operand(v.src(), funcdata, prog, info, buf, "a1");
+                buf.push(LAInst::Directive("\tadd.d $a0, $a0, $a1".into()));
+                store_result(*self, info, buf, "a0");
+            },
+            _ => todo!(),
         }
-        Ok(())
     }
 }
 
+fn emit_agg_store(funcdata: &FunctionData, info: &mut GenLAInfo, prog: &Program, buf: &mut Vec<LAInst>, agg: &values::Aggregate, mut base: usize) {
+    for v in agg.elems() {
+        match funcdata.dfg().value(v.clone()).kind() {
+            ValueKind::Aggregate(v) => emit_agg_store(funcdata, info, prog, buf, v, base),
+            ValueKind::Integer(v) => { load_imm32(buf, "a0", v.value()); buf.push(LAInst::StW { rd: "$a0".into(), rj: "$sp".into(), offset: base as i32 }); base += 4; },
+            _ => { load_operand(*v, funcdata, prog, info, buf, "a0"); buf.push(LAInst::StW { rd: "$a0".into(), rj: "$sp".into(), offset: base as i32 }); base += 4; },
+        }
+    }
+}
+
+// ─── Public API ──────────────────────────────────────────────────────────────
+
 pub fn generator_la(prog: &Program, writer: &mut impl Write) -> Result<()> {
     let mut info = GenLAInfo::new();
-    prog.generate(writer, &mut info, &prog)?;
+    let mut buf: Vec<LAInst> = Vec::new();
+    prog.generate(&mut info, prog, &mut buf);
+    optimize_la(&mut buf);
+    for inst in &buf {
+        inst.emit(writer)?;
+    }
     Ok(())
 }
